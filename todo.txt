@@ -1,0 +1,7 @@
+- [x] Create todo list.
+- [x] Analyze the codebase to understand the `readerthread` implementation.
+- [x] Identify the specific location of the "readerthread has no attribute" error.
+- [x] Determine the cause of the `AttributeError` (e.g., incorrect attribute access, thread not initialized, race condition).
+- [x] Implement a fix for the error.
+- [ ] Test the fix to ensure the error is resolved and no new issues are introduced.
+- [ ] Verify the UI is functioning correctly.

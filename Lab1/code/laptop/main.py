@@ -8,10 +8,12 @@ Usage:
     python main.py --host 192.168.1.50 --port 5000 --history 300
     # or, with mDNS if your device announces "esp-temp.local":
     python main.py --host esp-temp.local --port 5000
+    python main.py --host 127.0.0.1 --port 5000 --test-email seniordesignteam8uiowa@gmail.com SeniorDesign@Team8 seniordesignteam8uiowa@gmail.com
 
 Requires: matplotlib, zeroconf (optional, for .local names)
 """
 import argparse
+from email_handler import EmailHandler
 import json
 import queue
 import socket
@@ -49,12 +51,14 @@ def resolve_mdns(host):
 
 
 class ReaderThread(threading.Thread):
-    def __init__(self, host, port, data_q, status_q, reconnect_delay=3):
+    def __init__(self, host, port, data_q, status_q, max_temp_threshold=None, min_temp_threshold=None, reconnect_delay=3):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.data_q = data_q
         self.status_q = status_q
+        self.max_temp_threshold = max_temp_threshold
+        self.min_temp_threshold = min_temp_threshold
         self.reconnect_delay = reconnect_delay
         self._stop = threading.Event()
 
@@ -94,6 +98,15 @@ class ReaderThread(threading.Thread):
                                     if "sensor" not in obj:
                                         obj["sensor"] = "S1"
                                     self.data_q.put(obj)
+
+                                    # Check for alerts
+                                    current_temp_c = float(obj["t_c"])
+                                    current_sensor = str(obj.get("sensor", "S1"))
+                                    if self.max_temp_threshold is not None and current_temp_c > self.max_temp_threshold:
+                                        self._trigger_alert(current_sensor, current_temp_c, "above max threshold")
+                                    if self.min_temp_threshold is not None and current_temp_c < self.min_temp_threshold:
+                                        self._trigger_alert(current_sensor, current_temp_c, "below min threshold")
+
                                 else:
                                     self.notify(f"Skipped line (no t_c): {line[:80]!r}")
                             except json.JSONDecodeError:
@@ -111,6 +124,10 @@ class TempMonitorClientApp:
         self.port = port
         self.history_seconds = history_seconds
 
+        # Temperature unit and plot limits
+        self.temp_unit = 'C'
+        self.plot_limits = {'C': (10, 50), 'F': (50, 122)} # Requirement 5.c.i
+
         # Queues
         self.data_queue = queue.Queue()
         self.status_queue = queue.Queue()
@@ -120,11 +137,23 @@ class TempMonitorClientApp:
         self.latest = {}
         self.lines = {}
 
+        # Sensor states (initially off, as per requirement 4.c)
+        self.sensor_states = {'S1': 'off', 'S2': 'off'}
+
+        # Alert settings
+        self.max_temp_threshold = None
+        self.min_temp_threshold = None
+        self.recipient = None
+        self.sender_email = None
+        self.sender_password = None # Note: Storing passwords directly is insecure. Consider env vars or secure storage.
+
         # Build UI
         self._build_widgets()
 
         # Start reader
-        self.reader = ReaderThread(self.host, self.port, self.data_queue, self.status_queue)
+        self.reader = ReaderThread(self.host, self.port, self.data_queue, self.status_queue,
+                                   max_temp_threshold=self.max_temp_threshold,
+                                   min_temp_threshold=self.min_temp_threshold)
         self.reader.start()
 
         # Poll queues
@@ -138,6 +167,9 @@ class TempMonitorClientApp:
         top = ttk.Frame(main)
         top.pack(fill="x")
         ttk.Label(top, text=f"Connecting to {self.host}:{self.port}", font=("Segoe UI", 10, "bold")).pack(side="left")
+        # Add unit toggle button
+        self.unit_button = ttk.Button(top, text=f"Switch to {self.temp_unit}", command=self._toggle_unit)
+        self.unit_button.pack(side="right", padx=5)
         ttk.Button(top, text="Quit", command=self._on_quit).pack(side="right")
 
         mid = ttk.LabelFrame(main, text="Current Readings")
@@ -150,6 +182,49 @@ class TempMonitorClientApp:
 
         bottom = ttk.LabelFrame(main, text="Live Plot")
         bottom.pack(fill="both", expand=True)
+
+        # Alert Settings
+        alert_frame = ttk.LabelFrame(main, text="Alert Settings")
+        alert_frame.pack(fill="x", pady=(10, 10))
+
+        # Max Temp Threshold
+        max_temp_frame = ttk.Frame(alert_frame)
+        max_temp_frame.pack(fill="x", pady=2)
+        ttk.Label(max_temp_frame, text="Max Temp (°C):", width=15).pack(side="left", padx=5)
+        self.max_temp_entry = ttk.Entry(max_temp_frame, width=10)
+        self.max_temp_entry.pack(side="left", padx=5)
+
+        # Min Temp Threshold
+        min_temp_frame = ttk.Frame(alert_frame)
+        min_temp_frame.pack(fill="x", pady=2)
+        ttk.Label(min_temp_frame, text="Min Temp (°C):", width=15).pack(side="left", padx=5)
+        self.min_temp_entry = ttk.Entry(min_temp_frame, width=10)
+        self.min_temp_entry.pack(side="left", padx=5)
+
+        # Recipient
+        recipient_frame = ttk.Frame(alert_frame)
+        recipient_frame.pack(fill="x", pady=2)
+        ttk.Label(recipient_frame, text="Recipient (Email/Phone):", width=15).pack(side="left", padx=5)
+        self.recipient_entry = ttk.Entry(recipient_frame, width=30)
+        self.recipient_entry.pack(side="left", padx=5)
+
+        # Sender Email
+        sender_email_frame = ttk.Frame(alert_frame)
+        sender_email_frame.pack(fill="x", pady=2)
+        ttk.Label(sender_email_frame, text="Sender Email:", width=15).pack(side="left", padx=5)
+        self.sender_email_entry = ttk.Entry(sender_email_frame, width=30)
+        self.sender_email_entry.pack(side="left", padx=5)
+
+        # Sender Password
+        sender_password_frame = ttk.Frame(alert_frame)
+        sender_password_frame.pack(fill="x", pady=2)
+        ttk.Label(sender_password_frame, text="Sender Password:", width=15).pack(side="left", padx=5)
+        self.sender_password_entry = ttk.Entry(sender_password_frame, width=30)
+        self.sender_password_entry.pack(side="left", padx=5)
+
+        # Save Settings Button
+        self.save_settings_button = ttk.Button(alert_frame, text="Save Settings", command=self._save_alert_settings)
+        self.save_settings_button.pack(pady=5)
 
         self.fig = Figure(figsize=(7, 4), dpi=100)
         self.ax = self.fig.add_subplot(111)
@@ -169,6 +244,113 @@ class TempMonitorClientApp:
         except Exception:
             pass
         self.root.destroy()
+
+    def _toggle_unit(self):
+        if self.temp_unit == 'C':
+            self.temp_unit = 'F'
+        else:
+            self.temp_unit = 'C'
+        self.unit_button.config(text=f"Switch to {self.temp_unit}")
+        self._update_treeview_display() # Update treeview immediately
+        self._redraw_plot() # Redraw plot with new unit and limits
+
+    def _update_treeview_display(self):
+        # Clear and re-populate treeview with current data in the new unit
+        self.tree.delete(*self.tree.get_children())
+        for sensor, (t, temp_c) in sorted(self.latest.items()):
+            timestr = time.strftime("%H:%M:%S", time.localtime(t))
+            if self.temp_unit == 'F':
+                temp_display = f"{(temp_c * 9/5) + 32:.2f}"
+                self.tree.heading("temp", text="Temp (°F)")
+            else: # 'C'
+                temp_display = f"{temp_c:.2f}"
+                self.tree.heading("temp", text="Temp (°C)")
+        self.tree.insert("", "end", values=(sensor, temp_display, timestr))
+
+    def _toggle_sensor(self, sensor_id):
+        current_state = self.sensor_states.get(sensor_id, 'off')
+        new_state = 'on' if current_state == 'off' else 'off'
+        self.sensor_states[sensor_id] = new_state
+
+        # Update button text
+        if sensor_id == 'S1':
+            self.s1_button.config(text=f"Sensor 1: {new_state.capitalize()}")
+        elif sensor_id == 'S2':
+            self.s2_button.config(text=f"Sensor 2: {new_state.capitalize()}")
+
+        # Send command to device
+        command = {"command": "set_sensor", "sensor": sensor_id, "state": new_state}
+        self._send_command(command)
+
+    def _send_command(self, command_data):
+        # Placeholder for sending commands. Actual implementation requires socket communication.
+        # This will need to be integrated with the ReaderThread or a separate sender.
+        command_str = json.dumps(command_data) + '\n'
+        self.notify(f"Command to send: {command_str.strip()}")
+        # In a real implementation, this would send command_str over the socket.
+        # For now, we'll just update the status.
+        # The actual sending mechanism needs to be implemented.
+        # This is a complex part and might require refactoring ReaderThread.
+        # For now, we'll assume the device is listening for commands.
+        # If the device is expecting commands on a different port or via a different mechanism,
+        # this part would need significant changes.
+        # For now, we'll just print the command and update the status bar.
+
+    def _save_alert_settings(self):
+        try:
+            max_temp_str = self.max_temp_entry.get()
+            min_temp_str = self.min_temp_entry.get()
+            recipient = self.recipient_entry.get()
+
+            # Capture sender email and password
+            self.sender_email = self.sender_email_entry.get() if hasattr(self, 'sender_email_entry') else None
+            self.sender_password = self.sender_password_entry.get() if hasattr(self, 'sender_password_entry') else None
+
+            if max_temp_str:
+                self.max_temp_threshold = float(max_temp_str)
+            else:
+                self.max_temp_threshold = None
+
+            if min_temp_str:
+                self.min_temp_threshold = float(min_temp_str)
+            else:
+                self.min_temp_threshold = None
+
+            self.recipient = recipient if recipient else None
+
+            if self.max_temp_threshold is not None or self.min_temp_threshold is not None or self.recipient:
+                self.notify("Alert settings saved.")
+            else:
+                self.notify("Alert settings cleared.")
+
+        except ValueError:
+            self.notify("Invalid input for temperature thresholds. Please enter numbers.")
+        except Exception as e:
+            self.notify(f"Error saving alert settings: {e}")
+
+    def notify(self, msg):
+        """Updates the status bar with a message."""
+        self.status_var.set(msg)
+
+    def _trigger_alert(self, sensor, temp_c, alert_type):
+        # Placeholder for sending alerts. Actual implementation would use email/SMS.
+        message_body = f"ALERT: Sensor {sensor} is {alert_type} at {temp_c:.2f}°C."
+        subject = f"Temperature Alert: {sensor} {alert_type.split(' ')[-1]}"
+
+        if self.recipient:
+            if self.sender_email and self.sender_password:
+                try:
+                    email_handler = EmailHandler()
+                    if email_handler.send_email(self.sender_email, self.sender_password, self.recipient, subject, message_body):
+                        self.notify(f"Alert email sent to {self.recipient}.")
+                    else:
+                        self.notify(f"Failed to send alert email to {self.recipient}.")
+                except Exception as e:
+                    self.notify(f"Error during alert email sending: {e}")
+            else:
+                self.notify("Sender email or password not provided. Cannot send alert email.")
+        else:
+            self.notify(f"{message_body} (No recipient set).")
 
     def _drain_status(self):
         try:
@@ -195,19 +377,27 @@ class TempMonitorClientApp:
             pass
 
         if updated:
-            self.tree.delete(*self.tree.get_children())
-            for sensor, (t, temp) in sorted(self.latest.items()):
-                timestr = time.strftime("%H:%M:%S", time.localtime(t))
-                self.tree.insert("", "end", values=(sensor, f"{temp:.2f}", timestr))
+            self._update_treeview_display() # Update treeview with current data in selected unit
             self._redraw_plot()
         self.root.after(200, self._drain_data)
 
     def _redraw_plot(self):
         now = time.time()
         tmin = now - self.history_seconds
-        self.ax.clear()
+        now = time.time()
+        tmin = now - self.history_seconds
+        self.ax.clear() # Clear the axes before redrawing
         self.ax.set_xlabel("Time (s, recent)")
-        self.ax.set_ylabel("Temperature (°C)")
+
+        # Set y-axis label and limits based on selected unit
+        if self.temp_unit == 'F':
+            y_min, y_max = self.plot_limits['F']
+            self.ax.set_ylabel("Temperature (°F)")
+        else: # 'C'
+            y_min, y_max = self.plot_limits['C']
+            self.ax.set_ylabel("Temperature (°C)")
+        self.ax.set_ylim(y_min, y_max)
+
         self.ax.grid(True, which="both", linestyle="--", alpha=0.4)
         for sensor, dq in sorted(self.series.items()):
             xs, ys = [], []
@@ -216,7 +406,12 @@ class TempMonitorClientApp:
                     xs.append(t - now)
                     ys.append(y)
             if xs:
-                self.ax.plot(xs, ys, label=sensor)
+                # Convert y-values to the selected unit for plotting
+                if self.temp_unit == 'F':
+                    ys_converted = [(y * 9/5) + 32 for y in ys]
+                else: # 'C'
+                    ys_converted = ys
+                self.ax.plot(xs, ys_converted, label=sensor)
         if self.series:
             self.ax.legend(loc="upper left")
         self.canvas.draw_idle()
@@ -227,8 +422,28 @@ def main():
     parser.add_argument("--host", required=True, help="Device hostname or IP (supports .local if OS provides mDNS)")
     parser.add_argument("--port", type=int, default=5000, help="TCP port on device (default: 5000)")
     parser.add_argument("--history", type=int, default=300, help="History window in seconds (default: 300)")
+    # Add argument for testing email functionality
+    parser.add_argument('--test-email', nargs=3, metavar=('SENDER_EMAIL', 'SENDER_PASSWORD', 'RECIPIENT_EMAIL'),
+                        help='Test email functionality: provide sender email, sender password, and recipient email.')
     args = parser.parse_args()
 
+    # If testing email, send the email and exit
+    if args.test_email:
+        sender_email, sender_password, recipient_email = args.test_email
+        try:
+            email_handler = EmailHandler()
+            subject = "Test Email from Temperature Monitor"
+            body = "This is a test email to verify email sending functionality."
+            if email_handler.send_email(sender_email, sender_password, recipient_email, subject, body):
+                print(f"Test email successfully sent to {recipient_email}")
+            else:
+                print(f"Failed to send test email to {recipient_email}")
+        except Exception as e:
+            print(f"An error occurred while sending test email: {e}")
+        import sys
+        sys.exit(0)
+
+    # Otherwise, start the main application
     root = tk.Tk()
     app = TempMonitorClientApp(root, args.host, args.port, args.history)
     root.mainloop()
