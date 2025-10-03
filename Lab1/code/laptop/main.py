@@ -19,6 +19,7 @@ import socket
 import threading
 import time
 from collections import defaultdict, deque
+import math # Import math module for isnan
 
 import tkinter as tk
 from tkinter import ttk
@@ -50,12 +51,13 @@ def resolve_mdns(host):
 
 
 class ReaderThread(threading.Thread):
-    def __init__(self, host, port, data_q, status_q, max_temp_threshold=None, min_temp_threshold=None, reconnect_delay=3):
+    def __init__(self, host, port, data_q, status_q, trigger_alert_callback, max_temp_threshold=None, min_temp_threshold=None, reconnect_delay=3):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
         self.data_q = data_q
         self.status_q = status_q
+        self.trigger_alert_callback = trigger_alert_callback # Callback to trigger alert in main app
         self.max_temp_threshold = max_temp_threshold
         self.min_temp_threshold = min_temp_threshold
         self.reconnect_delay = reconnect_delay
@@ -102,9 +104,9 @@ class ReaderThread(threading.Thread):
                                     current_temp_c = float(obj["t_c"])
                                     current_sensor = str(obj.get("sensor", "S1"))
                                     if self.max_temp_threshold is not None and current_temp_c > self.max_temp_threshold:
-                                        self._trigger_alert(current_sensor, current_temp_c, "above max threshold")
+                                        self.trigger_alert_callback(current_sensor, current_temp_c, "above max threshold")
                                     if self.min_temp_threshold is not None and current_temp_c < self.min_temp_threshold:
-                                        self._trigger_alert(current_sensor, current_temp_c, "below min threshold")
+                                        self.trigger_alert_callback(current_sensor, current_temp_c, "below min threshold")
 
                                 else:
                                     self.notify(f"Skipped line (no t_c): {line[:80]!r}")
@@ -112,6 +114,7 @@ class ReaderThread(threading.Thread):
                                 self.notify(f"Bad JSON: {line[:80]!r}")
             except Exception as e:
                 self.notify(f"Disconnected: {e}. Reconnecting in {self.reconnect_delay}s ...")
+                self.status_q.put({"type": "disconnected", "timestamp": time.time()}) # Notify main app of disconnection
                 time.sleep(self.reconnect_delay)
 
 
@@ -145,19 +148,34 @@ class TempMonitorClientApp:
         self.recipient = None
         self.sender_email = None
         self.sender_password = None # Note: Storing passwords directly is insecure. Consider env vars or secure storage.
+        self.last_alert_time = 0 # Initialize last alert time for cooldown
 
         # Build UI
         self._build_widgets()
+        
+        # Load settings from file after UI is built
+        self._load_settings()
 
-        # Start reader
-        self.reader = ReaderThread(self.host, self.port, self.data_queue, self.status_queue,
-                                   max_temp_threshold=self.max_temp_threshold,
-                                   min_temp_threshold=self.min_temp_threshold)
-        self.reader.start()
+        # Start reader (will be re-initialized after settings are saved)
+        self.reader = None 
+        self._start_reader_thread() # Start the reader thread initially
 
         # Poll queues
         self.root.after(100, self._drain_status)
         self.root.after(100, self._drain_data)
+
+    def _start_reader_thread(self):
+        if self.reader and self.reader.is_alive():
+            self.reader.stop()
+            # Removed self.reader.join() to prevent UI freeze.
+            # The old thread is a daemon and will terminate when the main app exits.
+            # Or it will eventually exit its run loop when sock.recv times out or connection breaks.
+
+        self.reader = ReaderThread(self.host, self.port, self.data_queue, self.status_queue,
+                                   trigger_alert_callback=self._trigger_alert_from_reader,
+                                   max_temp_threshold=self.max_temp_threshold,
+                                   min_temp_threshold=self.min_temp_threshold)
+        self.reader.start()
 
     def _build_widgets(self):
         main = ttk.Frame(self.root, padding=10)
@@ -167,7 +185,7 @@ class TempMonitorClientApp:
         top.pack(fill="x")
         ttk.Label(top, text=f"Connecting to {self.host}:{self.port}", font=("Segoe UI", 10, "bold")).pack(side="left")
         # Add unit toggle button
-        self.unit_button = ttk.Button(top, text=f"Switch to {self.temp_unit}", command=self._toggle_unit)
+        self.unit_button = ttk.Button(top, text=f"Switch from {self.temp_unit}", command=self._toggle_unit)
         self.unit_button.pack(side="right", padx=5)
         ttk.Button(top, text="Quit", command=self._on_quit).pack(side="right")
 
@@ -222,7 +240,7 @@ class TempMonitorClientApp:
         self.sender_password_entry.pack(side="left", padx=5)
 
         # Save Settings Button
-        self.save_settings_button = ttk.Button(alert_frame, text="Save Settings", command=self._save_alert_settings)
+        self.save_settings_button = ttk.Button(alert_frame, text="Save Settings", command=self._save_all_settings)
         self.save_settings_button.pack(pady=5)
 
         self.fig = Figure(figsize=(7, 4), dpi=100)
@@ -230,12 +248,67 @@ class TempMonitorClientApp:
         self.ax.set_xlabel("Time (s, recent)")
         self.ax.set_ylabel("Temperature (°C)")
         self.ax.grid(True, which="both", linestyle="--", alpha=0.4)
+        self.ax.set_xlim(-self.history_seconds, 0) # Force x-axis bounds to -300 to 0
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=bottom)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main, textvariable=self.status_var, anchor="w").pack(fill="x", pady=(8, 0))
+
+    def _load_settings(self):
+        try:
+            with open("config.json", "r") as f:
+                settings = json.load(f)
+                self.max_temp_threshold = settings.get("max_temp_threshold")
+                self.min_temp_threshold = settings.get("min_temp_threshold")
+                self.recipient = settings.get("recipient_email")
+                self.sender_email = settings.get("sender_email")
+                self.sender_password = settings.get("sender_password")
+
+                # Update UI entries with loaded values
+                self.max_temp_entry.delete(0, tk.END)
+                if self.max_temp_threshold is not None:
+                    self.max_temp_entry.insert(0, str(self.max_temp_threshold))
+                
+                self.min_temp_entry.delete(0, tk.END)
+                if self.min_temp_threshold is not None:
+                    self.min_temp_entry.insert(0, str(self.min_temp_threshold))
+
+                self.recipient_entry.delete(0, tk.END)
+                if self.recipient is not None:
+                    self.recipient_entry.insert(0, self.recipient)
+
+                self.sender_email_entry.delete(0, tk.END)
+                if self.sender_email is not None:
+                    self.sender_email_entry.insert(0, self.sender_email)
+
+                self.sender_password_entry.delete(0, tk.END)
+                if self.sender_password is not None:
+                    self.sender_password_entry.insert(0, self.sender_password)
+
+            self.notify("Settings loaded from config.json.")
+        except FileNotFoundError:
+            self.notify("config.json not found. Using default settings.")
+        except json.JSONDecodeError:
+            self.notify("Error decoding config.json. Using default settings.")
+        except Exception as e:
+            self.notify(f"Error loading settings: {e}")
+
+    def _save_settings(self):
+        settings = {
+            "max_temp_threshold": self.max_temp_threshold,
+            "min_temp_threshold": self.min_temp_threshold,
+            "recipient_email": self.recipient,
+            "sender_email": self.sender_email,
+            "sender_password": self.sender_password
+        }
+        try:
+            with open("config.json", "w") as f:
+                json.dump(settings, f, indent=4)
+            self.notify("Settings saved to config.json.")
+        except Exception as e:
+            self.notify(f"Error saving settings: {e}")
 
     def _on_quit(self):
         try:
@@ -258,13 +331,18 @@ class TempMonitorClientApp:
         self.tree.delete(*self.tree.get_children())
         for sensor, (t, temp_c) in sorted(self.latest.items()):
             timestr = time.strftime("%H:%M:%S", time.localtime(t))
-            if self.temp_unit == 'F':
-                temp_display = f"{(temp_c * 9/5) + 32:.2f}"
-                self.tree.heading("temp", text="Temp (°F)")
-            else: # 'C'
-                temp_display = f"{temp_c:.2f}"
-                self.tree.heading("temp", text="Temp (°C)")
-        self.tree.insert("", "end", values=(sensor, temp_display, timestr))
+            temp_display = ""
+            if temp_c is not None and not float('nan') == temp_c:
+                if self.temp_unit == 'F':
+                    temp_display = f"{(temp_c * 9/5) + 32:.2f}"
+                    self.tree.heading("temp", text="Temp (°F)")
+                else: # 'C'
+                    temp_display = f"{temp_c:.2f}"
+                    self.tree.heading("temp", text="Temp (°C)")
+            else:
+                temp_display = "N/A" # Display N/A for disconnected data
+
+            self.tree.insert("", "end", values=(sensor, temp_display, timestr))
 
     def _toggle_sensor(self, sensor_id):
         current_state = self.sensor_states.get(sensor_id, 'off')
@@ -295,7 +373,7 @@ class TempMonitorClientApp:
         # this part would need significant changes.
         # For now, we'll just print the command and update the status bar.
 
-    def _save_alert_settings(self):
+    def _save_all_settings(self):
         try:
             max_temp_str = self.max_temp_entry.get()
             min_temp_str = self.min_temp_entry.get()
@@ -319,20 +397,37 @@ class TempMonitorClientApp:
 
             if self.max_temp_threshold is not None or self.min_temp_threshold is not None or self.recipient:
                 self.notify("Alert settings saved.")
+                if not (self.sender_email and self.sender_password and self.recipient):
+                    self.notify("Warning: Email alerts are enabled but sender email, password, or recipient is missing. Please check alert settings.")
             else:
                 self.notify("Alert settings cleared.")
+            
+            # Restart reader thread with updated thresholds
+            self._start_reader_thread()
 
         except ValueError:
             self.notify("Invalid input for temperature thresholds. Please enter numbers.")
         except Exception as e:
             self.notify(f"Error saving alert settings: {e}")
+        
+        self._save_settings() # Save current settings to config.json
 
     def notify(self, msg):
         """Updates the status bar with a message."""
         self.status_var.set(msg)
 
-    def _trigger_alert(self, sensor, temp_c, alert_type):
-        # Placeholder for sending alerts. Actual implementation would use email/SMS.
+    def _trigger_alert_from_reader(self, sensor, temp_c, alert_type):
+        """Callback from ReaderThread to trigger an alert in the main app."""
+        current_time = time.time()
+        if current_time - self.last_alert_time >= 60: # 60-second cooldown
+            self.last_alert_time = current_time
+            self._send_alert_email(sensor, temp_c, alert_type)
+            self.notify(f"UI Alert: {sensor} {alert_type} at {temp_c:.2f}°C. Email sent.")
+        else:
+            self.notify(f"UI Alert: {sensor} {alert_type} at {temp_c:.2f}°C. Email suppressed (cooldown).")
+
+    def _send_alert_email(self, sensor, temp_c, alert_type):
+        """Sends an email alert."""
         message_body = f"ALERT: Sensor {sensor} is {alert_type} at {temp_c:.2f}°C."
         subject = f"Temperature Alert: {sensor} {alert_type.split(' ')[-1]}"
 
@@ -355,7 +450,15 @@ class TempMonitorClientApp:
         try:
             while True:
                 msg = self.status_queue.get_nowait()
-                self.status_var.set(msg)
+                if isinstance(msg, dict) and msg.get("type") == "disconnected":
+                    # Insert None for all active sensors to create a gap
+                    timestamp = msg.get("timestamp", time.time())
+                    for sensor in self.series.keys():
+                        self.series[sensor].append((timestamp, float('nan')))
+                    self._redraw_plot() # Redraw immediately to show the gap
+                    self.status_var.set(f"Disconnected at {time.strftime('%H:%M:%S', time.localtime(timestamp))}. Reconnecting...")
+                else:
+                    self.status_var.set(msg)
         except queue.Empty:
             pass
         finally:
@@ -375,9 +478,9 @@ class TempMonitorClientApp:
         except queue.Empty:
             pass
 
-        if updated:
-            self._update_treeview_display() # Update treeview with current data in selected unit
-            self._redraw_plot()
+        # Always redraw plot to ensure scrolling and gaps are visible
+        self._update_treeview_display() # Update treeview with current data in selected unit
+        self._redraw_plot()
         self.root.after(200, self._drain_data)
 
     def _redraw_plot(self):
@@ -399,19 +502,40 @@ class TempMonitorClientApp:
 
         self.ax.grid(True, which="both", linestyle="--", alpha=0.4)
         for sensor, dq in sorted(self.series.items()):
-            xs, ys = [], []
+            xs, ys_converted = [], []
             for (t, y) in dq:
                 if t >= tmin:
                     xs.append(t - now)
-                    ys.append(y)
+                    if self.temp_unit == 'F':
+                        ys_converted.append((y * 9/5) + 32 if y is not None and not math.isnan(y) else math.nan)
+                    else: # 'C'
+                        ys_converted.append(y if y is not None and not math.isnan(y) else math.nan)
+            
+            
+            # Handle gaps for disconnected data
             if xs:
                 # Convert y-values to the selected unit for plotting
                 if self.temp_unit == 'F':
-                    ys_converted = [(y * 9/5) + 32 for y in ys]
+                    ys_converted = [(y * 9/5) + 32 if y is not None and not math.isnan(y) else math.nan for y in ys]
                 else: # 'C'
-                    ys_converted = ys
-                self.ax.plot(xs, ys_converted, label=sensor)
-        if self.series:
+                    ys_converted = [y if y is not None and not math.isnan(y) else math.nan for y in ys]
+                
+                # Plot segments separated by NaN values
+                # This creates the desired gaps in the plot
+                segment_xs, segment_ys = [], []
+                for i in range(len(xs)):
+                    if not math.isnan(ys_converted[i]):
+                        segment_xs.append(xs[i])
+                        segment_ys.append(ys_converted[i])
+                    else:
+                        if segment_xs: # Plot previous segment if it exists
+                            self.ax.plot(segment_xs, segment_ys, label=sensor)
+                            segment_xs, segment_ys = [], [] # Reset for next segment
+                if segment_xs: # Plot the last segment
+                    self.ax.plot(segment_xs, segment_ys, label=sensor)
+            
+        # Matplotlib can automatically handle unique labels if we just call legend
+        if self.series: # Only attempt to draw legend if there's any series data
             self.ax.legend(loc="upper left")
         self.canvas.draw_idle()
 

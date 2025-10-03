@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+env/
+venv/
+*.env
+*.bak
+*.tmp
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Application-specific config file
+config.json
