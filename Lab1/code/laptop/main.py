@@ -8,7 +8,6 @@ Usage:
     python main.py --host 192.168.1.50 --port 5000 --history 300
     # or, with mDNS if your device announces "esp-temp.local":
     python main.py --host esp-temp.local --port 5000
-    python main.py --host 127.0.0.1 --port 5000 --test-email seniordesignteam8uiowa@gmail.com SeniorDesign@Team8 seniordesignteam8uiowa@gmail.com
 
 Requires: matplotlib, zeroconf (optional, for .local names)
 """
