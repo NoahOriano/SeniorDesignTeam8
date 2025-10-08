@@ -110,24 +110,46 @@ bool convInFlight = false;
 
 float lastC1 = NAN, lastC2 = NAN;
 
-void startConversions() {
-  if (has1) s1.requestTemperatures();
-  if (has2) s2.requestTemperatures();
-  convStartMs = millis();
-  convInFlight = true;
-}
 bool conversionsReady() { return (millis() - convStartMs) >= CONV_MS_12BIT; }
 
-void readTemperatures() {
-  if (has1) {
-    float c1 = s1.getTempC(a1);
-    lastC1 = (c1 <= DEVICE_DISCONNECTED_C) ? NAN : c1;
-  } else lastC1 = NAN;
+void startConversions() {
+  // Only kick conversions for sensors that are present AND enabled
+  if (has1 && en1) s1.requestTemperaturesByAddress(a1);
+  if (has2 && en2) s2.requestTemperaturesByAddress(a2);
+  convStartMs = millis();
+  convInFlight = ( (has1 && en1) || (has2 && en2) );
+}
 
-  if (has2) {
+void readTemperatures() {
+  if (has1 && en1) {
+    float c1 = s1.getTempC(a1);
+    if (c1 == 85.0f || c1 <= DEVICE_DISCONNECTED_C || c1 < -55.0f || c1 > 125.0f) {
+      lastC1 = NAN;
+      // try a fresh conversion for this address
+      s1.requestTemperaturesByAddress(a1);
+      convStartMs = millis();
+      convInFlight = true;
+    } else {
+      lastC1 = c1;
+    }
+  } else {
+    // disabled or missing → no data
+    lastC1 = NAN;
+  }
+
+  if (has2 && en2) {
     float c2 = s2.getTempC(a2);
-    lastC2 = (c2 <= DEVICE_DISCONNECTED_C) ? NAN : c2;
-  } else lastC2 = NAN;
+    if (c2 == 85.0f || c2 <= DEVICE_DISCONNECTED_C || c2 < -55.0f || c2 > 125.0f) {
+      lastC2 = NAN;
+      s2.requestTemperaturesByAddress(a2);
+      convStartMs = millis();
+      convInFlight = true;
+    } else {
+      lastC2 = c2;
+    }
+  } else {
+    lastC2 = NAN;
+  }
 }
 
 // >>> FIX: only one setup() definition
