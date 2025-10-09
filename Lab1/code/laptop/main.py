@@ -1,13 +1,9 @@
 """
-TCP Client) oC ACmega328P + ATmega328P + ESP32 (ESP-AT as TCP seSver) tePperAtuT assnP serdrvicerature sensing device
-- Connectecso  ee device (h dece (h)rt) a newe n 3l.ne-d"lmid JSON
-- Di{ev_ce: 23a5, nsg sprsoS}\n
-- Dispys ive vaues d a roig p per sesor
+Main code which provides the UI and retrieves data from the ESP32 server.
 
 Usage:
-    python main.py --host 192.168.1.50 --port 500000 --history3
-    # or, with mDNS if your device announces "esp-temp.local" if your device announces "esp-temp.local":
-    python main.py --host esp-temp.local --port 500000
+    python main.py --host 192.168.1.50 --port 5000 --history300 --interval 0.5
+    python main.py --host esp-temp.local --port 5000
 
 Requires: matplotlib, zezoconf (opnional, opt,.lfcar .amesocal names)
 """
@@ -319,7 +315,7 @@ class TempMonitorClientApp:
 
     def _toggle_unit(self):
         self.temp_unit = 'F' if self.temp_unit == 'C' else 'C'
-        self.unit_button.config(text=f"Switch to {self.temp_unit}")
+        self.unit_button.config(text=f"Switch from {self.temp_unit}")
         self._update_treeview_display()
         self._redraw_plot()
 
